@@ -115,6 +115,8 @@ function loadCompactionPrompt(promptFile: string): string {
 
 let isCompacting = false;
 let compactionJustRan = false;
+/** Reference to TUI for requesting footer re-renders during autonomous loops. */
+let tuiRef: { requestRender(force?: boolean): void } | null = null;
 let compactionState: CompactionState = {
 	compactedTurnCount: 0,
 	accumulatedSummary: "",
@@ -297,6 +299,7 @@ function formatTokens(count: number): string {
 
 function installFooter(pi: ExtensionAPI, ctx: ExtensionContext) {
 	ctx.ui.setFooter((tui, theme, footerData) => {
+		tuiRef = tui; // Save for requestRender from event handlers
 		const unsubBranch = footerData.onBranchChange(() => tui.requestRender());
 
 		return {
@@ -414,6 +417,11 @@ function installFooter(pi: ExtensionAPI, ctx: ExtensionContext) {
 			},
 		};
 	});
+}
+
+/** Request a footer re-render (safe to call from any handler). */
+function requestFooterRender() {
+	tuiRef?.requestRender();
 }
 
 // ── Main Extension ───────────────────────────────────────────────────────────
@@ -577,7 +585,7 @@ export default function (pi: ExtensionAPI) {
 			currentTokens = sessionUsage?.tokens ?? rawEstimate;
 		}
 		compactionState.lastEstimateTokens = rawEstimate;
-
+		requestFooterRender(); // Update footer during autonomous loops
 		const usageRatio = contextWindow > 0 ? currentTokens / contextWindow : 0;
 
 		// Trigger compaction when:
@@ -599,45 +607,62 @@ export default function (pi: ExtensionAPI) {
 		try {
 			// We must work with the ORIGINAL turn boundaries (from session),
 			// not the re-applied ones, since the summary message replaced them.
-				const turnsAfterCompaction = turns.slice(compactionState.compactedTurnCount);
-			if (turnsAfterCompaction.length < 2) return;
+			const turnsAfterCompaction = turns.slice(compactionState.compactedTurnCount);
+			if (turnsAfterCompaction.length < 1) return;
 
 			// Multi-round tail compaction strategy:
 			//   Each round compacts the OLDEST uncompacted turns.
 			//   - Minimum per round: 10% of context window
-			//   - Hard ceiling: never compact past the 2nd-to-last
-			//     user turn (keep recent context intact)
+			//   - Hard ceiling: never compact the most recent messages
+			//     (keep recent context intact for the agent to work with)
 			//   - If still above start threshold after a round,
 			//     the delta approach will naturally trigger another round
 
-			// Ceiling: the 2nd-to-last user turn in the uncompacted region.
-			// Find it by scanning from the end.
-			let secondToLastUserIdx = -1;
-			let userCount = 0;
-			for (let i = turnsAfterCompaction.length - 1; i >= 0; i--) {
-				// A turn starts with a user message (by findTurnBoundaries)
-				const turnStartMsg = event.messages[turnsAfterCompaction[i].start];
-				if (turnStartMsg?.role === "user") {
-					userCount++;
-					if (userCount === 2) {
-						secondToLastUserIdx = i;
-						break;
-					}
+			// Ceiling: protect the most recent messages from compaction.
+			// Use a message-count ceiling rather than user-turn boundaries.
+			// This works in autonomous loops where there may be only 1 user turn
+			// (the initial prompt) followed by dozens of assistant/tool rounds.
+			//
+			// Scan the uncompacted messages from the end to find a cutoff point
+			// that protects the last N messages. A "message boundary" is a point
+			// between two messages where a user message follows — this ensures
+			// we don't split an assistant+toolResult pair.
+			const MIN_PROTECTED_MESSAGES = 20;
+			const uncompactedMsgs = event.messages.slice(
+				turnsAfterCompaction[0].start,
+				turnsAfterCompaction[turnsAfterCompaction.length - 1].end
+			);
+			let ceilingMsgIdx = uncompactedMsgs.length - MIN_PROTECTED_MESSAGES;
+
+			// Snap ceiling to the nearest user message boundary going backward.
+			// This ensures we don't cut in the middle of a tool exchange.
+			// (A boundary is where the next message has role === "user")
+			while (ceilingMsgIdx > 0 && uncompactedMsgs[ceilingMsgIdx]?.role !== "user") {
+				ceilingMsgIdx--;
+			}
+			if (ceilingMsgIdx <= 0) return; // Can't compact — too few messages
+
+			// Map ceilingMsgIdx back to a turn index — find the turn whose
+			// messages end at or before this ceiling position.
+			let ceilingTurnIdx = 0;
+			for (let i = 0; i < turnsAfterCompaction.length; i++) {
+				const turnEndRel = turnsAfterCompaction[i].end - turnsAfterCompaction[0].start;
+				if (turnEndRel <= ceilingMsgIdx) {
+					ceilingTurnIdx = i + 1;
+				} else {
+					break;
 				}
 			}
-			// If < 2 user turns, can't determine ceiling — skip
-			if (secondToLastUserIdx < 0) return;
+			if (ceilingTurnIdx === 0) return; // Nothing to compact
 
-			const ceilingIdx = secondToLastUserIdx;
 			const minSavings = Math.floor(contextWindow * 0.1);
-			const targetTokens = Math.floor(contextWindow * settings.stopThreshold);
 			let newCompactCount = 0;
 			let estimatedSavings = 0;
 			const summaryOverhead = 500;
 
 			// Compact oldest turns, one at a time, until we've freed
 			// at least 10% of context. Never go past the ceiling.
-			for (let i = 0; i < ceilingIdx; i++) {
+			for (let i = 0; i < ceilingTurnIdx; i++) {
 				const turn = turnsAfterCompaction[i];
 				const turnMessages = event.messages.slice(turn.start, turn.end);
 				estimatedSavings += estimateMessageTokens(turnMessages);
@@ -805,6 +830,7 @@ export default function (pi: ExtensionAPI) {
 				// usage.input alone only counts non-cached tokens, which is
 				// much lower than the real context size when caching is active.
 				const totalInput = (m.usage.input ?? 0) + (m.usage.cacheRead ?? 0) + (m.usage.cacheWrite ?? 0);
+
 				if (totalInput > 0) {
 					const shouldUpdate = compactionJustRan || compactionState.awaitingRealMeasurement || totalInput > compactionState.lastCompactedTokens;
 					if (shouldUpdate) {
@@ -814,7 +840,7 @@ export default function (pi: ExtensionAPI) {
 					// Resetting it to 0 would skip the delta branch entirely.
 					compactionJustRan = false;
 					compactionState.awaitingRealMeasurement = false;
-
+					requestFooterRender(); // Update footer with real measurement
 						// Persist the REAL token count (not an estimate)
 						pi.appendEntry("lc-state", {
 							compactedTurnCount: compactionState.compactedTurnCount,
