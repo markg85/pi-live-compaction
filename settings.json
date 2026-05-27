@@ -1,0 +1,10 @@
+{
+	"liveCompaction": {
+		"enabled": true,
+		"startThreshold": 0.7,
+		"stopThreshold": 0.4,
+		"provider": null,
+		"model": null,
+		"compactionPromptFile": "compaction-prompt.md"
+	}
+}

@@ -1,0 +1,12 @@
+{
+  "name": "pi-live-compaction",
+  "version": "1.0.0",
+  "description": "Live tail compaction extension for pi coding agent - compacts conversation tail when context exceeds thresholds",
+  "main": "live-compaction.ts",
+  "author": "Mark Gaiser <markg85@gmail.com>",
+  "license": "MIT",
+  "pi": {
+    "extensions": ["live-compaction.ts"]
+  },
+  "keywords": ["pi", "pi-extension", "compaction", "context-window"]
+}
